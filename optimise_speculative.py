@@ -14,6 +14,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 TOKENS_PER_SECOND_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*(?:tokens/s|tok/s)", re.IGNORECASE)
+EPSILON_DISTANCE = 1e-6
+EPSILON_VARIANCE = 1e-12
+QUICK_SAMPLING_ATTEMPTS = 300
+MAX_CANDIDATE_POOL = 128
+MAX_POOL_ATTEMPTS = 2000
+EXPLORATION_WEIGHT = 1.4
+DISTANCE_WEIGHT = 0.15
 
 DEFAULT_SEARCH_SPACE = {
     "prompt_argument": "--prompt",
@@ -271,11 +278,14 @@ class SearchSpace:
 
         method = self._method_by_name[candidate.method_name]
         if method.drafter_chains:
-            chain_index = method.drafter_chains.index(candidate.drafter_chain or method.drafter_chains[0])
-            if len(method.drafter_chains) == 1:
-                features.append(0.0)
+            if candidate.drafter_chain in method.drafter_chains:
+                chain_index = method.drafter_chains.index(candidate.drafter_chain)
+                if len(method.drafter_chains) == 1:
+                    features.append(0.0)
+                else:
+                    features.append(chain_index / (len(method.drafter_chains) - 1))
             else:
-                features.append(chain_index / (len(method.drafter_chains) - 1))
+                features.append(-1.0)
         else:
             features.append(0.0)
 
@@ -283,7 +293,10 @@ class SearchSpace:
         for param in method.parameters:
             active[param.name] = param
         for namespace, param in self._feature_schema:
-            if namespace not in ("common", method.name) or param.name not in active:
+            if namespace not in ("common", method.name):
+                features.append(-1.0)
+                continue
+            if param.name not in active:
                 features.append(-1.0)
             else:
                 features.append(param.normalize(candidate.parameters[param.name]))
@@ -364,7 +377,7 @@ def evaluate_candidate(
             command = cli_prefix + [prompt_argument, prompt]
             started = time.perf_counter()
             process = subprocess.run(command, capture_output=True, text=True, check=False)
-            elapsed = max(time.perf_counter() - started, 1e-6)
+            elapsed = max(time.perf_counter() - started, EPSILON_DISTANCE)
             runs += 1
             merged_output = (process.stdout or "") + "\n" + (process.stderr or "")
             if process.returncode != 0:
@@ -408,11 +421,11 @@ def predict_candidate_score(candidate_features: List[float], history: Sequence[D
         distances.append((distance, score))
     distances.sort(key=lambda row: row[0])
     neighbours = distances[: min(6, len(distances))]
-    weights = [1.0 / (row[0] + 1e-6) for row in neighbours]
+    weights = [1.0 / (row[0] + EPSILON_DISTANCE) for row in neighbours]
     weight_sum = sum(weights)
     mean = sum(weight * score for weight, (_, score) in zip(weights, neighbours)) / weight_sum
     variance = sum(weight * ((score - mean) ** 2) for weight, (_, score) in zip(weights, neighbours)) / weight_sum
-    stddev = math.sqrt(max(variance, 1e-12))
+    stddev = math.sqrt(max(variance, EPSILON_VARIANCE))
     min_distance = neighbours[0][0]
     return mean, stddev, min_distance
 
@@ -424,7 +437,7 @@ def choose_candidate(
     evaluated_keys: set,
     best_candidate: Optional[Candidate],
 ) -> Candidate:
-    for _ in range(300):
+    for _ in range(QUICK_SAMPLING_ATTEMPTS):
         if best_candidate and rng.random() < 0.65:
             candidate = search_space.mutate_candidate(best_candidate, rng)
         else:
@@ -434,7 +447,7 @@ def choose_candidate(
 
     sampled: List[Candidate] = []
     attempts = 0
-    while len(sampled) < 128 and attempts < 2000:
+    while len(sampled) < MAX_CANDIDATE_POOL and attempts < MAX_POOL_ATTEMPTS:
         attempts += 1
         if best_candidate and rng.random() < 0.8:
             candidate = search_space.mutate_candidate(best_candidate, rng)
@@ -452,7 +465,7 @@ def choose_candidate(
     for candidate in sampled:
         features = search_space.candidate_features(candidate)
         mean, stddev, distance = predict_candidate_score(features, history)
-        acquisition = mean + 1.4 * stddev + 0.15 * distance
+        acquisition = mean + EXPLORATION_WEIGHT * stddev + DISTANCE_WEIGHT * distance
         if best_acquisition is None or acquisition > best_acquisition:
             best_acquisition = acquisition
             best = candidate
@@ -531,6 +544,8 @@ def main() -> None:
     best_score = float("-inf")
     best_candidate: Optional[Candidate] = None
 
+    warmup = min(args.max_iterations, max(5, search_space.parameter_count * 2))
+
     if progress:
         print(f"Resuming from progress file: {progress_path}")
         for item in progress.get("history", []):
@@ -541,14 +556,13 @@ def main() -> None:
                 best_candidate = candidate_from_dict(item["candidate"])
 
     start_iteration = len(history)
-    if best_candidate is None:
-        warmup = min(args.max_iterations, max(5, search_space.parameter_count * 2))
+    if not progress:
         print(f"Starting optimization. warmup={warmup} max_iterations={args.max_iterations}")
     else:
         print(f"Continuing optimization from iteration {start_iteration}, best score={best_score:.6f}")
 
     for iteration in range(start_iteration, args.max_iterations):
-        if best_candidate is None:
+        if best_candidate is None or iteration < warmup:
             candidate = search_space.random_candidate(rng)
             while candidate.key() in evaluated_keys:
                 candidate = search_space.random_candidate(rng)
