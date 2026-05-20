@@ -16,11 +16,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 TOKENS_PER_SECOND_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*(?:tokens/s|tok/s)", re.IGNORECASE)
 EPSILON_DISTANCE = 1e-6
 EPSILON_VARIANCE = 1e-12
+MIN_ELAPSED_TIME = 1e-6
 QUICK_SAMPLING_ATTEMPTS = 300
 MAX_CANDIDATE_POOL = 128
 MAX_POOL_ATTEMPTS = 2000
 EXPLORATION_WEIGHT = 1.4
 DISTANCE_WEIGHT = 0.15
+K_NEIGHBORS = 6
+MIN_WARMUP_ITERATIONS = 5
+WARMUP_MULTIPLIER = 2
 
 DEFAULT_SEARCH_SPACE = {
     "prompt_argument": "--prompt",
@@ -74,15 +78,26 @@ class ParameterSpec:
     def from_json(name: str, raw: Dict[str, Any]) -> "ParameterSpec":
         kind = raw.get("type")
         if kind == "int":
+            minimum = int(raw["min"])
+            maximum = int(raw["max"])
+            step = int(raw.get("step", 1))
+            if maximum < minimum:
+                raise ValueError(f"int parameter '{name}' has max < min")
+            if step <= 0:
+                raise ValueError(f"int parameter '{name}' step must be > 0")
             return ParameterSpec(
                 name=name,
                 kind=kind,
-                minimum=int(raw["min"]),
-                maximum=int(raw["max"]),
-                step=int(raw.get("step", 1)),
+                minimum=minimum,
+                maximum=maximum,
+                step=step,
             )
         if kind == "float":
-            return ParameterSpec(name=name, kind=kind, minimum=float(raw["min"]), maximum=float(raw["max"]))
+            minimum = float(raw["min"])
+            maximum = float(raw["max"])
+            if maximum < minimum:
+                raise ValueError(f"float parameter '{name}' has max < min")
+            return ParameterSpec(name=name, kind=kind, minimum=minimum, maximum=maximum)
         if kind == "categorical":
             options = tuple(raw["options"])
             if not options:
@@ -96,7 +111,7 @@ class ParameterSpec:
         if self.kind == "int":
             assert self.minimum is not None and self.maximum is not None and self.step is not None
             choices = int((self.maximum - self.minimum) / self.step) + 1
-            idx = rng.randrange(max(1, choices))
+            idx = rng.randrange(choices)
             return int(self.minimum + idx * self.step)
         if self.kind == "float":
             assert self.minimum is not None and self.maximum is not None
@@ -112,7 +127,7 @@ class ParameterSpec:
         if self.kind == "int":
             assert self.minimum is not None and self.maximum is not None and self.step is not None
             width = max(self.step, (self.maximum - self.minimum) / 8)
-            delta = int(round(rng.gauss(0, width) / self.step)) * int(self.step)
+            delta = int(round(rng.gauss(0, width) / self.step)) * self.step
             candidate = int(value) + delta
             candidate = max(int(self.minimum), min(int(self.maximum), candidate))
             snapped = int(round((candidate - self.minimum) / self.step) * self.step + self.minimum)
@@ -377,7 +392,7 @@ def evaluate_candidate(
             command = cli_prefix + [prompt_argument, prompt]
             started = time.perf_counter()
             process = subprocess.run(command, capture_output=True, text=True, check=False)
-            elapsed = max(time.perf_counter() - started, EPSILON_DISTANCE)
+            elapsed = max(time.perf_counter() - started, MIN_ELAPSED_TIME)
             runs += 1
             merged_output = (process.stdout or "") + "\n" + (process.stderr or "")
             if process.returncode != 0:
@@ -420,7 +435,7 @@ def predict_candidate_score(candidate_features: List[float], history: Sequence[D
         distance = math.sqrt(squared)
         distances.append((distance, score))
     distances.sort(key=lambda row: row[0])
-    neighbours = distances[: min(6, len(distances))]
+    neighbours = distances[: min(K_NEIGHBORS, len(distances))]
     weights = [1.0 / (row[0] + EPSILON_DISTANCE) for row in neighbours]
     weight_sum = sum(weights)
     mean = sum(weight * score for weight, (_, score) in zip(weights, neighbours)) / weight_sum
@@ -544,7 +559,7 @@ def main() -> None:
     best_score = float("-inf")
     best_candidate: Optional[Candidate] = None
 
-    warmup = min(args.max_iterations, max(5, search_space.parameter_count * 2))
+    warmup = min(args.max_iterations, max(MIN_WARMUP_ITERATIONS, search_space.parameter_count * WARMUP_MULTIPLIER))
 
     if progress:
         print(f"Resuming from progress file: {progress_path}")
@@ -591,7 +606,8 @@ def main() -> None:
             best_score = score
             best_candidate = candidate
 
-        assert best_candidate is not None
+        if best_candidate is None:
+            raise RuntimeError("internal error: best candidate missing after evaluation")
         print_live_stats(record, best_score, best_candidate)
 
         payload = {
@@ -614,7 +630,8 @@ def main() -> None:
         }
         atomic_write_json(progress_path, payload)
 
-    assert best_candidate is not None
+    if best_candidate is None:
+        raise RuntimeError("internal error: no candidate was evaluated")
     print("\nOptimization complete.")
     print(f"Best score: {best_score:.6f}")
     print(f"Best method: {best_candidate.method_name}")
