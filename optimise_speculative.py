@@ -375,6 +375,13 @@ def parse_tokens_per_second(output: str) -> Optional[float]:
     return statistics.mean(values)
 
 
+def subprocess_isolation_kwargs() -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {"stdin": subprocess.DEVNULL}
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
 def evaluate_candidate(
     llama_cli: Path,
     search_space: SearchSpace,
@@ -391,7 +398,13 @@ def evaluate_candidate(
         for prompt in prompts:
             command = cli_prefix + [prompt_argument, prompt]
             started = time.perf_counter()
-            process = subprocess.run(command, capture_output=True, text=True, check=False)
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                **subprocess_isolation_kwargs(),
+            )
             elapsed = max(time.perf_counter() - started, MIN_ELAPSED_TIME)
             runs += 1
             merged_output = (process.stdout or "") + "\n" + (process.stderr or "")
