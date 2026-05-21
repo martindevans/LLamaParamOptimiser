@@ -376,6 +376,13 @@ def parse_tokens_per_second(output: str) -> Optional[float]:
 
 
 def subprocess_isolation_kwargs() -> Dict[str, Any]:
+    """Return subprocess kwargs that prevent child terminal/PTY access.
+
+    stdin is redirected to DEVNULL on all platforms so the child cannot read
+    from the parent terminal stream. On POSIX, start_new_session detaches the
+    child from the parent's session, which prevents access to the controlling
+    terminal via /dev/tty.
+    """
     kwargs: Dict[str, Any] = {"stdin": subprocess.DEVNULL}
     if os.name == "posix":
         kwargs["start_new_session"] = True
@@ -544,6 +551,7 @@ def print_live_stats(record: Dict[str, Any], best_score: float, best_candidate: 
 
 
 def main() -> None:
+    """Parse CLI args and run the speculative decoding parameter optimizer."""
     parser = argparse.ArgumentParser(description="Optimise llama.cpp speculative decoding parameters")
     parser.add_argument("--llama-cli", required=True, type=Path, help="Path to llama-cli executable")
     parser.add_argument("--trials-per-setting", required=True, type=int, help="Number of trials per candidate setting")
