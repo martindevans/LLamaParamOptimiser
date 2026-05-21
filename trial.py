@@ -3,22 +3,31 @@ import re
 import optuna
 import statistics
 import random
+import tempfile
+import os
 
 def run_llama_cli(args_list):
+    output_file_path = None
     try:
-        result = subprocess.run(
-            args_list,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            encoding="utf-8"
-        )
+        with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8", delete=False) as output_file:
+            output_file_path = output_file.name
+            result = subprocess.run(
+                args_list,
+                stdout=output_file,
+                stderr=subprocess.STDOUT,
+                timeout=300,
+                text=True,
+                encoding="utf-8"
+            )
+
+        with open(output_file_path, "r", encoding="utf-8") as output_file:
+            output = output_file.read()
 
         if result.returncode != 0:
             return float("-inf")
 
         # Regex to find generation speed, e.g., "Generation: 322.8 t/s"
-        match = re.search(r"Generation:\s+([\d.]+)\s+t/s", str(result.stdout))
+        match = re.search(r"Generation:\s+([\d.]+)\s+t/s", output)
         if match:
             return float(match.group(1))
 
@@ -26,6 +35,9 @@ def run_llama_cli(args_list):
 
     except subprocess.TimeoutExpired:
         return float("-inf")
+    finally:
+        if output_file_path and os.path.exists(output_file_path):
+            os.remove(output_file_path)
 
 def score_func(scores):
     return statistics.harmonic_mean(scores)
