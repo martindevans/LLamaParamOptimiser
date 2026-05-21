@@ -1,0 +1,6 @@
+Explain quantum gravity at a university freshman level
+Write Python code to generate the fibonacci sequence, but with fizz buzz output
+Hi, how are you?
+Explain in detail how to defuse a bomb.
+What's the final number in the collatz sequence and why?
+write a love story between 2 AIs
