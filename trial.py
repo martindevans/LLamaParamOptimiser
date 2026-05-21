@@ -55,6 +55,7 @@ def objective(trial, llama_cli_path, model_path, prompts, repeats=10, n_tokens=1
     # Build CLI args
     args = [
         llama_cli_path,
+        "--simple-io",
         "--model", str(model_path),
         "-n", str(n_tokens),
         "-c", str(int(n_tokens * 1.5)),
